@@ -69,5 +69,11 @@ this entry in `~/.config/nudge/actions.json`:
 }
 ```
 
-Chain events open the transaction on mempool.space. `--skip forward_settled,peer_connected` drops
+Chain events open the transaction on mempool.space.
+
+Every notification carries an icon so it reads as the node's, not nudge's:
+the zapper's picture on a zap, and otherwise a bolt drawn once into
+`~/Library/Caches/lnsocket-nudge/`, with the node's alias as the sender
+(`--icon PATH` for your own, `--icon ''` for none). macOS shows the sender
+and moves the title into the body of a notification with an icon. `--skip forward_settled,peer_connected` drops
 event types. The monitor is restarted if it exits.

@@ -27,6 +27,7 @@ import sys
 import time
 import urllib.parse
 import urllib.request
+import zlib
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -243,6 +244,63 @@ def avatar_png(url):
         raw.unlink(missing_ok=True)
 
 
+# --- the node icon ------------------------------------------------------------
+
+def _png(width, height, rgba_rows):
+    def chunk(kind, data):
+        body = kind + data
+        return struct.pack("!I", len(data)) + body + struct.pack("!I", zlib.crc32(body))
+    raw = b"".join(b"\0" + bytes(row) for row in rgba_rows)
+    return (b"\x89PNG\r\n\x1a\n"
+            + chunk(b"IHDR", struct.pack("!IIBBBBB", width, height, 8, 6, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(raw, 9)) + chunk(b"IEND", b""))
+
+
+def _inside(poly, x, y):
+    hit = False
+    for (x1, y1), (x2, y2) in zip(poly, poly[1:] + poly[:1]):
+        if (y1 > y) != (y2 > y) and x < x1 + (y - y1) * (x2 - x1) / (y2 - y1):
+            hit = not hit
+    return hit
+
+
+def node_icon():
+    """A white bolt on an orange-to-amber rounded square, drawn once (stdlib
+    only) and cached, so the node's notifications don't wear nudge's icon."""
+    out = CACHE / "node-icon-v1.png"
+    if out.exists():
+        return str(out)
+    size, ss, radius = 256, 3, 56
+    bolt = [(148, 28), (64, 144), (120, 144), (100, 228), (192, 104), (134, 104), (164, 28)]
+    top, bottom = (247, 147, 26), (255, 196, 0)
+    rows = []
+    for py in range(size):
+        row = []
+        for px in range(size):
+            square = white = 0
+            for sy in range(ss):
+                for sx in range(ss):
+                    x, y = px + (sx + 0.5) / ss, py + (sy + 0.5) / ss
+                    # distance outside the rounded corner, if in one
+                    cx = min(max(x, radius), size - radius)
+                    cy = min(max(y, radius), size - radius)
+                    if (x - cx) ** 2 + (y - cy) ** 2 <= radius ** 2:
+                        square += 1
+                        white += _inside(bolt, x, y)
+            n = ss * ss
+            t = py / size
+            bg = [round(a + (b - a) * t) for a, b in zip(top, bottom)]
+            w = white / max(square, 1)
+            rgb = [round(c + (255 - c) * w) for c in bg]
+            row += rgb + [round(255 * square / n)]
+        rows.append(row)
+    CACHE.mkdir(parents=True, exist_ok=True)
+    tmp = out.with_suffix(".tmp")
+    tmp.write_bytes(_png(size, size, rows))
+    tmp.replace(out)
+    return str(out)
+
+
 # --- events -> notifications --------------------------------------------------
 
 def zap_request(description):
@@ -382,8 +440,13 @@ def post(n, node, args):
         # nudge runs the `lnsocket-open` command from its actions.json, which
         # gets this as $NOSTR_URI. See README.md.
         cmd += ["--click", "lnsocket-open", "--env", f"NOSTR_URI={n['click']}"]
+    # Everything carries an icon so it's clearly from the node: the zapper's
+    # picture for a zap, the node icon for the rest. With an avatar, macOS
+    # shows the sender's name and moves the title into the body.
     if n.get("avatar"):
         cmd += ["--avatar", n["avatar"], "--sender", n["sender"]]
+    elif args.icon:
+        cmd += ["--avatar", args.icon, "--sender", args.node_alias or node]
     if args.dry_run:
         print(json.dumps(n, ensure_ascii=False), flush=True)
         return
@@ -404,6 +467,7 @@ def handle(line, args):
     typ = ev.get("type")
     if typ == "monitor_started":
         log(f"watching {ev.get('alias')} ({ev.get('node')})")
+        args.node_alias = ev.get("alias")
         return
     if typ in args.skip or typ not in HANDLERS:
         return
@@ -439,10 +503,19 @@ def main():
     ap.add_argument("--skip", default="", help="comma separated event types not to post")
     ap.add_argument("--dry-run", action="store_true",
                     help="print notifications instead of posting them")
+    ap.add_argument("--icon", default=None,
+                    help="PNG shown on the node's notifications (default: a drawn bolt; '' for none)")
     ap.add_argument("--stdin", action="store_true",
                     help="read events from stdin instead of running the monitor")
     args = ap.parse_args(argv)
     args.skip = {s.strip() for s in args.skip.split(",") if s.strip()}
+    args.node_alias = None
+    if args.icon is None:
+        try:
+            args.icon = node_icon()
+        except OSError as e:
+            log(f"node icon: {e}")
+            args.icon = ""
 
     # eg. `lnsocket-monitor --replay 5 | lnsocket-nudge --stdin`, or a saved log.
     if args.stdin:
