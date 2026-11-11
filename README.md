@@ -90,6 +90,18 @@ It uses `lnsocket-monitor` from your PATH, or the one built in this checkout,
 and restarts it if it exits. `--skip forward_settled,peer_connected` drops
 event types.
 
+To keep it running, install it as a launchd agent. It starts at login and is
+restarted if it exits, logging to `~/Library/Logs/lnsocket-nudge.log`:
+
+```sh
+contrib/nudge/install-launchd                                  # builds the monitor if needed
+contrib/nudge/install-launchd --skip forward_settled -- -n mynode   # arguments pass through
+contrib/nudge/install-launchd --uninstall
+```
+
+It writes `~/Library/LaunchAgents/com.jb55.lnsocket-nudge.plist` with the
+monitor's absolute path, so run it again after moving the checkout.
+
 Zaps are looked up on a local nostr relay (notedeck's, `ws://127.0.0.1:6677`
 by default; `--relay ''` turns it off) for the zapper's name and avatar and
 the zapped note. Clicking a zap opens what was zapped (the note, or the

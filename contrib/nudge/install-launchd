@@ -1,0 +1,93 @@
+#!/bin/bash
+# install-launchd: keep lnsocket-nudge running as a launchd agent.
+#
+#   contrib/nudge/install-launchd [lnsocket-nudge args...] [-- lnsocket-monitor args...]
+#   contrib/nudge/install-launchd --uninstall
+#
+# Writes ~/Library/LaunchAgents/com.jb55.lnsocket-nudge.plist and loads it,
+# so the notifier starts at login and launchd restarts it if it exits.
+# Arguments are passed through, eg.
+#
+#   contrib/nudge/install-launchd --skip forward_settled -- -n mynode --peers
+#
+# Run it again to change the arguments or after moving the checkout. The log
+# is ~/Library/Logs/lnsocket-nudge.log.
+set -euo pipefail
+
+label=com.jb55.lnsocket-nudge
+plist="$HOME/Library/LaunchAgents/$label.plist"
+log="$HOME/Library/Logs/lnsocket-nudge.log"
+domain="gui/$(id -u)"
+here=$(cd "$(dirname "$0")" && pwd)
+repo=$(cd "$here/../.." && pwd)
+
+unload() {
+    launchctl bootout "$domain/$label" 2>/dev/null || true
+}
+
+if [ "${1-}" = "--uninstall" ]; then
+    unload
+    rm -f "$plist"
+    echo "removed $label"
+    exit 0
+fi
+
+# Find the monitor now and pin its absolute path, since launchd's PATH is
+# not your shell's. Build it if there isn't one.
+monitor=$(command -v lnsocket-monitor || true)
+if [ -z "$monitor" ]; then
+    monitor="$repo/target/release/lnsocket-monitor"
+    if [ ! -x "$monitor" ]; then
+        echo "building lnsocket-monitor in $repo"
+        (cd "$repo" && cargo build --release)
+    fi
+fi
+
+# launchd's environment is minimal, so give lnsocket-nudge a PATH that finds
+# nudge (and nd, for click actions run by nudge itself).
+path="$HOME/bin:$HOME/.local/bin:$HOME/.cargo/bin:$HOME/.nix-profile/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
+
+xml() {
+    local s=$1
+    s=${s//&/&amp;}
+    s=${s//</&lt;}
+    s=${s//>/&gt;}
+    printf '%s' "$s"
+}
+
+args=(/usr/bin/python3 "$here/lnsocket-nudge" --monitor "$monitor" "$@")
+argxml=""
+for a in "${args[@]}"; do
+    argxml+="    <string>$(xml "$a")</string>"$'\n'
+done
+
+mkdir -p "$(dirname "$plist")" "$(dirname "$log")"
+cat > "$plist" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>$label</string>
+  <key>ProgramArguments</key>
+  <array>
+$argxml  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key><string>$(xml "$path")</string>
+  </dict>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>ThrottleInterval</key><integer>30</integer>
+  <key>StandardErrorPath</key><string>$(xml "$log")</string>
+  <key>StandardOutPath</key><string>$(xml "$log")</string>
+</dict>
+</plist>
+EOF
+plutil -lint "$plist" >/dev/null
+
+unload
+launchctl bootstrap "$domain" "$plist"
+echo "loaded $label"
+echo "  monitor: $monitor"
+echo "  log:     $log"
+echo "  stop:    $0 --uninstall"
