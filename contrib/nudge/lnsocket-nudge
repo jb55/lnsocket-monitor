@@ -30,7 +30,8 @@ import urllib.request
 import zlib
 from pathlib import Path
 
-HERE = Path(__file__).resolve().parent
+# contrib/nudge/ in the lnsocket-monitor checkout
+REPO = Path(__file__).resolve().parent.parent.parent
 CACHE = Path.home() / "Library" / "Caches" / "lnsocket-nudge"
 
 
@@ -481,11 +482,15 @@ def handle(line, args):
 
 
 def find_monitor():
-    for p in (HERE / "target" / "release" / "lnsocket-monitor",
-              HERE / "target" / "debug" / "lnsocket-monitor"):
+    """On PATH (cargo install), else built in the checkout this script is in."""
+    found = shutil.which("lnsocket-monitor")
+    if found:
+        return found
+    for p in (REPO / "target" / "release" / "lnsocket-monitor",
+              REPO / "target" / "debug" / "lnsocket-monitor"):
         if p.exists():
             return str(p)
-    return shutil.which("lnsocket-monitor") or "lnsocket-monitor"
+    return "lnsocket-monitor"
 
 
 def main():

@@ -2,24 +2,41 @@
 
 Watch a Core Lightning node over [commando](https://docs.corelightning.org/reference/lightning-commando)
 with [lnsocket-rs](https://github.com/jb55/lnsocket-rs) and print interesting
-events to stdout as JSON lines. `lnsocket-nudge` turns them into macOS
-notifications with [nudge](https://github.com/jb55/nudge).
+events to stdout as JSON lines: payments received and sent, forwards,
+on-chain deposits, channels opened and closed. [`contrib/nudge`](contrib/nudge)
+turns them into macOS notifications with [nudge](https://github.com/jb55/nudge).
+
+Site: https://jb55.github.io/lnsocket-monitor/
 
 ```sh
-cargo build --release
-./lnsocket-nudge                  # run the monitor and post notifications
-./lnsocket-nudge -- -n mynode --peers
-target/release/lnsocket-monitor --replay 5 | ./lnsocket-nudge --stdin --dry-run
+cargo install --git https://github.com/jb55/lnsocket-monitor
+lnsocket-monitor                           # the default node from your lnrpc config
+lnsocket-monitor -n mynode --peers | jq .
+lnsocket-monitor --replay 5                # also print the last 5 of each kind, to try it out
 ```
 
 ## Node auth
 
-The node comes from the `lnrpc` config (`lnrpc config add <name> <nodeid> <host> <rune>`):
-`-c <path>`, `$LNRPC_CONFIG`, `$XDG_CONFIG_HOME/lnrpc/config.toml` or
+The node comes from the [`lnrpc`](https://github.com/jb55/lnsocket-rs#lnrpc)
+config: `-c <path>`, `$LNRPC_CONFIG`, `$XDG_CONFIG_HOME/lnrpc/config.toml` or
 `~/.config/lnrpc/config.toml`, and `-n <name>` picks a node other than the
-default. The rune needs `getinfo`, `wait`, `listinvoices`, `listsendpays`,
+default. Add one with:
+
+```sh
+lnrpc config add mynode <nodeid> <host[:port]> <rune>
+```
+
+A read-only rune is enough. On the node:
+
+```sh
+lightning-cli createrune restrictions='[["method^list","method^get","method=wait"],["method/listdatastore"]]'
+```
+
+The calls it makes are `getinfo`, `wait`, `listinvoices`, `listsendpays`,
 `listforwards`, `listchainmoves`, `listnodes`, `listpeerchannels` and
-`listclosedchannels` (plus `listnetworkevents` for `--peers`).
+`listclosedchannels`, plus `listnetworkevents` for `--peers`. A node too old
+to `wait` on a subsystem (`chainmoves` and `networkevents` are recent) has it
+skipped, with a note on stderr. It was built against v26.06.
 
 ## Events
 
@@ -36,7 +53,9 @@ Every line has `type`, `node` (the config name) and `time`. Amounts are msat.
 | `channel_closed` | chainmoves | `peer_alias`, `capacity_msat`, `to_us_msat`, `closing_txid` |
 | `peer_connected`, `peer_disconnected` | networkevents, with `--peers` | `peer_alias` (channel peers only) |
 
-`--replay N` also reports the last N updates of each kind at startup, for testing.
+```json
+{"type":"invoice_paid","node":"mynode","time":1794390955,"label":"coffee","amount_msat":21000,"amount_received_msat":21000,"payment_hash":"…","bolt12":false}
+```
 
 ## How it works
 
@@ -54,7 +73,22 @@ The `list*`, `listnodes` and heartbeat calls share one `CommandoClient`.
 This needs lnsocket-rs's `fixes` branch, where `read_custom` is cancel-safe;
 on master a request sent while a reply is half read desyncs the stream.
 
-## lnsocket-nudge
+## contrib/nudge: macOS notifications
+
+[`contrib/nudge/lnsocket-nudge`](contrib/nudge/lnsocket-nudge) runs
+`lnsocket-monitor` and posts each event with
+[nudge](https://github.com/jb55/nudge) (`brew install --cask jb55/nudge/nudge`).
+It's one Python file, standard library only.
+
+```sh
+contrib/nudge/lnsocket-nudge                          # run the monitor, post notifications
+contrib/nudge/lnsocket-nudge -- -n mynode --peers     # arguments after -- go to the monitor
+lnsocket-monitor --replay 5 | contrib/nudge/lnsocket-nudge --stdin --dry-run
+```
+
+It uses `lnsocket-monitor` from your PATH, or the one built in this checkout,
+and restarts it if it exits. `--skip forward_settled,peer_connected` drops
+event types.
 
 Zaps are looked up on a local nostr relay (notedeck's, `ws://127.0.0.1:6677`
 by default; `--relay ''` turns it off) for the zapper's name and avatar and
@@ -75,5 +109,4 @@ Every notification carries an icon so it reads as the node's, not nudge's:
 the zapper's picture on a zap, and otherwise a bolt drawn once into
 `~/Library/Caches/lnsocket-nudge/`, with the node's alias as the sender
 (`--icon PATH` for your own, `--icon ''` for none). macOS shows the sender
-and moves the title into the body of a notification with an icon. `--skip forward_settled,peer_connected` drops
-event types. The monitor is restarted if it exits.
+and moves the title into the body of a notification with an icon.
