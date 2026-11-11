@@ -1,0 +1,482 @@
+#!/usr/bin/env python3
+"""lnsocket-nudge: post macOS notifications for lightning node events.
+
+Runs lnsocket-monitor, reads the JSON lines it prints, and posts each event
+with nudge (https://github.com/jb55/nudge). Zaps are looked up on a local
+nostr relay (notedeck's, ws://127.0.0.1:6677 by default) so the notification
+shows who zapped, their avatar, and the note they zapped. The relay is
+optional: if it isn't there, zaps are posted with what the invoice has.
+
+    lnsocket-nudge [--skip TYPE,...] [--relay URL] [--monitor PATH] [-- MONITOR ARGS...]
+    lnsocket-monitor --replay 5 | lnsocket-nudge --stdin [--dry-run]
+
+Everything after `--` goes to lnsocket-monitor, eg. `-- -n mynode --peers`.
+The monitor is restarted if it exits.
+"""
+
+import argparse
+import base64
+import hashlib
+import json
+import os
+import shutil
+import socket
+import struct
+import subprocess
+import sys
+import time
+import urllib.parse
+import urllib.request
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+CACHE = Path.home() / "Library" / "Caches" / "lnsocket-nudge"
+
+
+def log(msg):
+    print(f"lnsocket-nudge: {msg}", file=sys.stderr, flush=True)
+
+
+# --- formatting ---------------------------------------------------------------
+
+def sats(msat):
+    """21000 -> '21', 1500 -> '1.5', 123456789000 -> '123,456,789'"""
+    if msat is None:
+        return "?"
+    s = f"{msat / 1000:,.3f}".rstrip("0").rstrip(".")
+    return s
+
+
+def short(node_id, alias=None):
+    return alias or (node_id[:12] + "…" if node_id else "unknown")
+
+
+def clip(text, n=140):
+    text = " ".join((text or "").split())
+    return text if len(text) <= n else text[: n - 1] + "…"
+
+
+# --- bech32, for note1 links --------------------------------------------------
+
+CHARSET = "qpzry9x8gf2tvdw0s3jn54khce6mua7l"
+
+
+def _polymod(values):
+    gen = [0x3B6A57B2, 0x26508E6D, 0x1EA119FA, 0x3D4233DD, 0x2A1462B3]
+    chk = 1
+    for v in values:
+        top = chk >> 25
+        chk = (chk & 0x1FFFFFF) << 5 ^ v
+        for i in range(5):
+            chk ^= gen[i] if ((top >> i) & 1) else 0
+    return chk
+
+
+def bech32_encode(hrp, data_bytes):
+    acc, bits, data = 0, 0, []
+    for b in data_bytes:
+        acc = (acc << 8) | b
+        bits += 8
+        while bits >= 5:
+            bits -= 5
+            data.append((acc >> bits) & 31)
+    if bits:
+        data.append((acc << (5 - bits)) & 31)
+    hrp_exp = [ord(c) >> 5 for c in hrp] + [0] + [ord(c) & 31 for c in hrp]
+    pm = _polymod(hrp_exp + data + [0] * 6) ^ 1
+    checksum = [(pm >> 5 * (5 - i)) & 31 for i in range(6)]
+    return hrp + "1" + "".join(CHARSET[d] for d in data + checksum)
+
+
+# --- a minimal websocket client for the local relay ---------------------------
+
+class Relay:
+    """Just enough websocket to send a REQ and read events until EOSE."""
+
+    def __init__(self, url, timeout=2.0):
+        u = urllib.parse.urlparse(url)
+        if u.scheme != "ws":
+            raise ValueError(f"only ws:// relays are supported: {url}")
+        self.sock = socket.create_connection((u.hostname, u.port or 80), timeout)
+        self.sock.settimeout(timeout)
+        key = base64.b64encode(os.urandom(16)).decode()
+        path = u.path or "/"
+        req = (
+            f"GET {path} HTTP/1.1\r\nHost: {u.netloc}\r\nUpgrade: websocket\r\n"
+            f"Connection: Upgrade\r\nSec-WebSocket-Key: {key}\r\n"
+            "Sec-WebSocket-Version: 13\r\n\r\n"
+        )
+        self.sock.sendall(req.encode())
+        head = b""
+        while b"\r\n\r\n" not in head:
+            chunk = self.sock.recv(4096)
+            if not chunk:
+                raise ConnectionError("relay closed during handshake")
+            head += chunk
+        head, self.buf = head.split(b"\r\n\r\n", 1)
+        if b" 101 " not in head.split(b"\r\n", 1)[0]:
+            raise ConnectionError(f"relay refused upgrade: {head[:80]!r}")
+
+    def close(self):
+        try:
+            self.sock.close()
+        except OSError:
+            pass
+
+    def _read(self, n):
+        while len(self.buf) < n:
+            chunk = self.sock.recv(65536)
+            if not chunk:
+                raise ConnectionError("relay closed")
+            self.buf += chunk
+        out, self.buf = self.buf[:n], self.buf[n:]
+        return out
+
+    def _send(self, opcode, payload):
+        mask = os.urandom(4)
+        n = len(payload)
+        if n < 126:
+            head = struct.pack("!BB", 0x80 | opcode, 0x80 | n)
+        elif n < 1 << 16:
+            head = struct.pack("!BBH", 0x80 | opcode, 0x80 | 126, n)
+        else:
+            head = struct.pack("!BBQ", 0x80 | opcode, 0x80 | 127, n)
+        masked = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
+        self.sock.sendall(head + mask + masked)
+
+    def send(self, msg):
+        self._send(0x1, json.dumps(msg).encode())
+
+    def recv(self):
+        """The next text message, reassembled from fragments."""
+        parts = []
+        while True:
+            b0, b1 = self._read(2)
+            opcode, n = b0 & 0x0F, b1 & 0x7F
+            if n == 126:
+                (n,) = struct.unpack("!H", self._read(2))
+            elif n == 127:
+                (n,) = struct.unpack("!Q", self._read(8))
+            mask = self._read(4) if b1 & 0x80 else None
+            payload = self._read(n)
+            if mask:
+                payload = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
+            if opcode == 0x8:
+                raise ConnectionError("relay closed")
+            if opcode == 0x9:
+                self._send(0xA, payload)
+                continue
+            if opcode in (0x1, 0x0):
+                parts.append(payload)
+                if b0 & 0x80:
+                    return json.loads(b"".join(parts))
+
+    def query(self, *filters):
+        sub = os.urandom(4).hex()
+        self.send(["REQ", sub, *filters])
+        events = []
+        while True:
+            msg = self.recv()
+            if msg[:2] == ["EVENT", sub]:
+                events.append(msg[2])
+            elif msg[:2] in (["EOSE", sub], ["CLOSED", sub]):
+                self.send(["CLOSE", sub])
+                return events
+
+
+def relay_lookup(url, pubkey, note_id):
+    """(profile dict, note content) from the relay; either may be None."""
+    if not url:
+        return None, None
+    filters = []
+    if pubkey:
+        filters.append({"kinds": [0], "authors": [pubkey], "limit": 1})
+    if note_id:
+        filters.append({"ids": [note_id]})
+    if not filters:
+        return None, None
+    try:
+        relay = Relay(url)
+    except (OSError, ValueError, ConnectionError) as e:
+        log(f"relay {url}: {e}")
+        return None, None
+    profile = note = None
+    try:
+        for ev in relay.query(*filters):
+            if ev.get("kind") == 0 and ev.get("pubkey") == pubkey:
+                try:
+                    profile = json.loads(ev.get("content") or "{}")
+                except ValueError:
+                    pass
+            elif ev.get("id") == note_id:
+                note = ev.get("content")
+    except (OSError, ValueError, ConnectionError) as e:
+        log(f"relay {url}: {e}")
+    finally:
+        relay.close()
+    return profile, note
+
+
+def avatar_png(url):
+    """Download a profile picture into the cache as a PNG nudge can use."""
+    if not url or not url.startswith(("http://", "https://")):
+        return None
+    CACHE.mkdir(parents=True, exist_ok=True)
+    out = CACHE / (hashlib.sha256(url.encode()).hexdigest()[:24] + ".png")
+    if out.exists():
+        return str(out)
+    raw = out.with_suffix(".download")
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "lnsocket-nudge"})
+        with urllib.request.urlopen(req, timeout=5) as resp, open(raw, "wb") as f:
+            f.write(resp.read(5 * 1024 * 1024))
+        # sips reads whatever macOS can (jpeg, webp, gif...) and writes a PNG.
+        subprocess.run(
+            ["sips", "-s", "format", "png", "-Z", "256", str(raw), "--out", str(out)],
+            check=True, capture_output=True, timeout=15,
+        )
+        return str(out)
+    except (OSError, subprocess.SubprocessError, ValueError) as e:
+        log(f"avatar {url}: {e}")
+        return None
+    finally:
+        raw.unlink(missing_ok=True)
+
+
+# --- events -> notifications --------------------------------------------------
+
+def zap_request(description):
+    """The kind 9734 zap request in a zap invoice's description, if it is one."""
+    try:
+        zr = json.loads(description or "")
+    except ValueError:
+        return None
+    return zr if isinstance(zr, dict) and zr.get("kind") == 9734 else None
+
+
+def tag(ev, name):
+    for t in ev.get("tags", []):
+        if len(t) >= 2 and t[0] == name:
+            return t[1]
+    return None
+
+
+def invoice_paid(ev, args):
+    amount = sats(ev.get("amount_received_msat") or ev.get("amount_msat"))
+    zr = zap_request(ev.get("description"))
+    if not zr:
+        return {
+            "title": f"⚡ Received {amount} sats",
+            "message": clip(ev.get("description") or ev.get("label") or "invoice paid"),
+            "thread": "received",
+        }
+
+    anon = any(t and t[0] == "anon" for t in zr.get("tags", []))
+    pubkey = None if anon else zr.get("pubkey")
+    note_id = tag(zr, "e")
+    profile, note = relay_lookup(args.relay, pubkey, note_id)
+    profile = profile or {}
+    name = profile.get("display_name") or profile.get("name")
+    if anon:
+        name = "anonymous"
+    elif not name and pubkey:
+        name = bech32_encode("npub", bytes.fromhex(pubkey))[:16] + "…"
+
+    n = {
+        "title": f"⚡ {amount} sats from {name or 'someone'}",
+        "message": clip(zr.get("content")) or (f"on: {clip(note, 100)}" if note else "zapped you"),
+        "thread": "zaps",
+    }
+    if zr.get("content") and note:
+        n["subtitle"] = f"on: {clip(note, 80)}"
+    # Clicking opens what was zapped in notedeck: the note, or for a profile
+    # zap, the profile.
+    target = tag(zr, "p")
+    if note_id:
+        n["click"] = "nostr:" + bech32_encode("note", bytes.fromhex(note_id))
+    elif target:
+        n["click"] = "nostr:" + bech32_encode("npub", bytes.fromhex(target))
+    avatar = avatar_png(profile.get("picture"))
+    if avatar:
+        n["avatar"], n["sender"] = avatar, name or "zap"
+    return n
+
+
+def payment_sent(ev, _args):
+    dest = short(ev.get("destination"), ev.get("destination_alias"))
+    msg = f"to {dest} · fee {sats(ev.get('fee_msat'))} sats"
+    desc = ev.get("description")
+    if desc and not zap_request(desc):
+        msg += f"\n{clip(desc)}"
+    return {"title": f"Sent {sats(ev.get('amount_msat'))} sats", "message": msg, "thread": "sent"}
+
+
+def forward_settled(ev, _args):
+    src = ev.get("in_alias") or ev.get("in_channel")
+    dst = ev.get("out_alias") or ev.get("out_channel")
+    return {
+        "title": f"Forwarded {sats(ev.get('out_msat'))} sats",
+        "message": f"{src} → {dst}",
+        "subtitle": f"earned {sats(ev.get('fee_msat'))} sats",
+        "thread": "forwards",
+    }
+
+
+def onchain_deposit(ev, _args):
+    return {
+        "title": f"On-chain deposit: {sats(ev.get('amount_msat'))} sats",
+        "message": f"confirmed in block {ev.get('blockheight')}",
+        "url": f"https://mempool.space/tx/{ev.get('txid')}",
+        "thread": "onchain",
+    }
+
+
+def channel_opened(ev, _args):
+    who = "you" if ev.get("opener") == "local" else "them"
+    return {
+        "title": f"Channel opened with {short(ev.get('peer_id'), ev.get('peer_alias'))}",
+        "message": f"{sats(ev.get('capacity_msat'))} sats, opened by {who}",
+        "url": f"https://mempool.space/tx/{ev.get('funding_txid')}",
+        "thread": "channels",
+    }
+
+
+def channel_closed(ev, _args):
+    return {
+        "title": f"Channel closed with {short(ev.get('peer_id'), ev.get('peer_alias'))}",
+        "message": f"{sats(ev.get('capacity_msat'))} sats channel, "
+        f"{sats(ev.get('to_us_msat'))} sats ours",
+        "url": f"https://mempool.space/tx/{ev.get('closing_txid')}",
+        "thread": "channels",
+    }
+
+
+def peer_event(ev, _args):
+    verb = "connected" if ev["type"] == "peer_connected" else "disconnected"
+    return {
+        "title": f"{short(ev.get('peer_id'), ev.get('peer_alias'))} {verb}",
+        "message": clip(ev.get("reason")) or f"channel peer {verb}",
+        "thread": "peers",
+    }
+
+
+HANDLERS = {
+    "invoice_paid": invoice_paid,
+    "payment_sent": payment_sent,
+    "forward_settled": forward_settled,
+    "onchain_deposit": onchain_deposit,
+    "channel_opened": channel_opened,
+    "channel_closed": channel_closed,
+    "peer_connected": peer_event,
+    "peer_disconnected": peer_event,
+}
+
+
+def post(n, node, args):
+    cmd = [args.nudge, "--title", n["title"], "--message", n["message"],
+           "--thread", f"lnsocket-{node}-{n['thread']}"]
+    for key in ("subtitle", "url"):
+        if n.get(key):
+            cmd += [f"--{key}", n[key]]
+    if n.get("click"):
+        # nudge runs the `lnsocket-open` command from its actions.json, which
+        # gets this as $NOSTR_URI. See README.md.
+        cmd += ["--click", "lnsocket-open", "--env", f"NOSTR_URI={n['click']}"]
+    if n.get("avatar"):
+        cmd += ["--avatar", n["avatar"], "--sender", n["sender"]]
+    if args.dry_run:
+        print(json.dumps(n, ensure_ascii=False), flush=True)
+        return
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        if r.returncode != 0:
+            log(f"nudge exited {r.returncode}: {r.stderr.strip()}")
+    except (OSError, subprocess.SubprocessError) as e:
+        log(f"nudge: {e}")
+
+
+def handle(line, args):
+    try:
+        ev = json.loads(line)
+    except ValueError:
+        log(f"not json: {line[:200]}")
+        return
+    typ = ev.get("type")
+    if typ == "monitor_started":
+        log(f"watching {ev.get('alias')} ({ev.get('node')})")
+        return
+    if typ in args.skip or typ not in HANDLERS:
+        return
+    try:
+        n = HANDLERS[typ](ev, args)
+    except Exception as e:  # one odd event shouldn't stop the rest
+        log(f"{typ}: {e!r}")
+        return
+    if n:
+        post(n, ev.get("node", "ln"), args)
+
+
+def find_monitor():
+    for p in (HERE / "target" / "release" / "lnsocket-monitor",
+              HERE / "target" / "debug" / "lnsocket-monitor"):
+        if p.exists():
+            return str(p)
+    return shutil.which("lnsocket-monitor") or "lnsocket-monitor"
+
+
+def main():
+    argv = sys.argv[1:]
+    monitor_args = []
+    if "--" in argv:
+        i = argv.index("--")
+        argv, monitor_args = argv[:i], argv[i + 1:]
+
+    ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    ap.add_argument("--monitor", default=find_monitor(), help="lnsocket-monitor binary")
+    ap.add_argument("--nudge", default=shutil.which("nudge") or "nudge", help="nudge binary")
+    ap.add_argument("--relay", default="ws://127.0.0.1:6677",
+                    help="nostr relay for zap profiles and notes ('' to skip)")
+    ap.add_argument("--skip", default="", help="comma separated event types not to post")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="print notifications instead of posting them")
+    ap.add_argument("--stdin", action="store_true",
+                    help="read events from stdin instead of running the monitor")
+    args = ap.parse_args(argv)
+    args.skip = {s.strip() for s in args.skip.split(",") if s.strip()}
+
+    # eg. `lnsocket-monitor --replay 5 | lnsocket-nudge --stdin`, or a saved log.
+    if args.stdin:
+        for line in sys.stdin:
+            handle(line, args)
+        return
+
+    backoff = 5
+    while True:
+        started = time.monotonic()
+        log(f"starting {args.monitor} {' '.join(monitor_args)}")
+        try:
+            proc = subprocess.Popen([args.monitor, *monitor_args], stdout=subprocess.PIPE,
+                                    text=True, bufsize=1)
+        except OSError as e:
+            log(f"can't run {args.monitor}: {e}")
+            sys.exit(1)
+        try:
+            for line in proc.stdout:
+                handle(line, args)
+            code = proc.wait()
+        except KeyboardInterrupt:
+            proc.terminate()
+            proc.wait()
+            return
+        # A monitor that ran a while gets restarted quickly; one that keeps
+        # dying straight away backs off.
+        backoff = 5 if time.monotonic() - started > 300 else min(backoff * 2, 300)
+        log(f"monitor exited ({code}); restarting in {backoff}s")
+        try:
+            time.sleep(backoff)
+        except KeyboardInterrupt:
+            return
+
+
+if __name__ == "__main__":
+    main()
