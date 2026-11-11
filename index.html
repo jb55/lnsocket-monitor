@@ -1,0 +1,559 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>lnsocket-monitor</title>
+<meta name="description" content="Watch a Core Lightning node over commando and get its payments, forwards, deposits and channel changes as JSON lines, or as macOS notifications.">
+<meta property="og:title" content="lnsocket-monitor">
+<meta property="og:description" content="Your Lightning node as a stream of events: JSON lines over commando, and macOS notifications with nudge.">
+<meta property="og:type" content="website">
+<meta name="color-scheme" content="light dark">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Cdefs%3E%3ClinearGradient id='g' x1='0' y1='0' x2='0' y2='1'%3E%3Cstop offset='0' stop-color='%23f7931a'/%3E%3Cstop offset='1' stop-color='%23ffc400'/%3E%3C/linearGradient%3E%3C/defs%3E%3Crect width='32' height='32' rx='7' fill='url(%23g)'/%3E%3Cpath d='M18.5 3.5 8 18h7l-2.5 10.5L24 13h-7.3z' fill='%23fff'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=JetBrains+Mono:wght@400;500;700&family=Space+Grotesk:wght@500;700&display=swap" rel="stylesheet">
+<style>
+:root {
+  --bg: #f6f3ea;
+  --bg-band: #efeadd;
+  --card: #fffdf7;
+  --fg: #1b1a16;
+  --muted: #5b574d;
+  --line: #ddd6c4;
+  --accent: #a35200;
+  --accent-fill: #f2a93b;
+  --accent-ink: #1b1a16;
+  --code-bg: #ece6d6;
+  --term-bg: #15140f;
+  --term-line: #2c2a22;
+  --term-fg: #e8e2d2;
+  --term-dim: #8f897a;
+  --term-prompt: #f2a93b;
+  --term-key: #9ec5f4;
+  --term-str: #b9dc82;
+  --term-num: #e6a7d8;
+  --notif-bg: rgba(250, 248, 242, .86);
+  --notif-line: rgba(0, 0, 0, .08);
+  --notif-fg: #1b1a16;
+  --notif-muted: #6a665c;
+  --wire: #b9b19c;
+  --wire-live: #a35200;
+  --shadow: 0 1px 0 rgba(0,0,0,.04), 0 18px 40px -24px rgba(40,30,0,.35);
+  --sans: "IBM Plex Sans", system-ui, -apple-system, "Segoe UI", sans-serif;
+  --display: "Space Grotesk", var(--sans);
+  --mono: "JetBrains Mono", ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  color-scheme: light;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #11100d;
+    --bg-band: #17160f;
+    --card: #1a1914;
+    --fg: #ece7da;
+    --muted: #a6a092;
+    --line: #2e2b23;
+    --accent: #f2a93b;
+    --accent-fill: #f2a93b;
+    --accent-ink: #15140f;
+    --code-bg: #201e18;
+    --term-bg: #0b0a08;
+    --term-line: #2a281f;
+    --notif-bg: rgba(40, 38, 32, .86);
+    --notif-line: rgba(255, 255, 255, .08);
+    --notif-fg: #ece7da;
+    --notif-muted: #a6a092;
+    --wire: #4a463a;
+    --wire-live: #f2a93b;
+    --shadow: 0 1px 0 rgba(255,255,255,.03), 0 18px 40px -24px rgba(0,0,0,.8);
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #11100d;
+  --bg-band: #17160f;
+  --card: #1a1914;
+  --fg: #ece7da;
+  --muted: #a6a092;
+  --line: #2e2b23;
+  --accent: #f2a93b;
+  --accent-fill: #f2a93b;
+  --accent-ink: #15140f;
+  --code-bg: #201e18;
+  --term-bg: #0b0a08;
+  --term-line: #2a281f;
+  --notif-bg: rgba(40, 38, 32, .86);
+  --notif-line: rgba(255, 255, 255, .08);
+  --notif-fg: #ece7da;
+  --notif-muted: #a6a092;
+  --wire: #4a463a;
+  --wire-live: #f2a93b;
+  --shadow: 0 1px 0 rgba(255,255,255,.03), 0 18px 40px -24px rgba(0,0,0,.8);
+  color-scheme: dark;
+}
+* { box-sizing: border-box; }
+html { -webkit-text-size-adjust: 100%; }
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--fg);
+  font: 400 1.0625rem/1.65 var(--sans);
+  overflow-x: hidden;
+}
+a { color: var(--accent); text-underline-offset: .18em; }
+a:hover { text-decoration-thickness: 2px; }
+code, pre { font-family: var(--mono); }
+:not(pre) > code {
+  font-size: .86em;
+  background: var(--code-bg);
+  padding: .1em .38em;
+  border-radius: 5px;
+  overflow-wrap: anywhere;
+}
+.wrap { width: min(1120px, 100% - 32px); margin-inline: auto; }
+
+/* header */
+.top { display: flex; align-items: center; justify-content: space-between; padding: 22px 0; gap: 16px; }
+.brand { display: flex; align-items: center; gap: 10px; font: 700 1.1rem/1 var(--mono); color: var(--fg); text-decoration: none; }
+.brand svg { width: 28px; height: 28px; flex: none; }
+.top nav { display: flex; gap: 20px; font-size: .95rem; flex-wrap: wrap; justify-content: flex-end; }
+.top nav a { color: var(--muted); text-decoration: none; }
+.top nav a:hover { color: var(--fg); }
+
+/* hero */
+.hero { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.08fr); gap: 56px; align-items: center; padding: 40px 0 88px; }
+.eyebrow { font: 500 .78rem/1.4 var(--mono); letter-spacing: .08em; text-transform: uppercase; color: var(--muted); margin: 0 0 18px; }
+h1 { font: 700 clamp(2.3rem, 5.6vw, 4.1rem)/1 var(--mono); letter-spacing: -.05em; margin: 0 0 22px; overflow-wrap: anywhere; }
+h1 .bolt { color: var(--accent-fill); }
+.lede { font-size: 1.22rem; line-height: 1.55; color: var(--muted); margin: 0 0 30px; max-width: 36ch; }
+.lede strong { color: var(--fg); font-weight: 600; }
+.actions { display: flex; flex-wrap: wrap; gap: 10px; margin-bottom: 30px; }
+.btn {
+  display: inline-flex; align-items: center; gap: 8px;
+  font: 600 .95rem/1 var(--sans);
+  padding: 12px 18px; border-radius: 10px; text-decoration: none;
+  border: 1px solid var(--line); color: var(--fg); background: var(--card);
+}
+.btn:hover { border-color: var(--muted); text-decoration: none; }
+.btn.primary { background: var(--accent-fill); border-color: var(--accent-fill); color: var(--accent-ink); }
+.btn.primary:hover { filter: brightness(1.05); }
+.btn svg { width: 18px; height: 18px; }
+.cmd {
+  display: flex; align-items: center; gap: 10px;
+  background: var(--card); border: 1px solid var(--line); border-radius: 10px;
+  padding: 10px 10px 10px 14px; min-width: 0;
+}
+.cmd code { flex: 1; min-width: 0; font-size: .84rem; white-space: nowrap; overflow-x: auto; scrollbar-width: none; background: none; padding: 0; overflow-wrap: normal; }
+.cmd code::-webkit-scrollbar { display: none; }
+.copy {
+  flex: none; font: 500 .75rem/1 var(--mono); color: var(--muted);
+  background: transparent; border: 1px solid var(--line); border-radius: 7px; padding: 7px 9px; cursor: pointer;
+}
+.copy:hover { color: var(--fg); border-color: var(--muted); }
+
+/* terminal */
+.term {
+  background: var(--term-bg); color: var(--term-fg);
+  border-radius: 14px; border: 1px solid var(--term-line);
+  box-shadow: var(--shadow); overflow: hidden; min-width: 0;
+}
+.term-bar { display: flex; align-items: center; gap: 7px; padding: 12px 14px; border-bottom: 1px solid var(--term-line); }
+.term-bar i { width: 11px; height: 11px; border-radius: 50%; background: #3a372d; display: block; }
+.term-bar span { margin-left: 8px; font: 400 .75rem/1 var(--mono); color: var(--term-dim); }
+.term pre {
+  margin: 0; padding: 18px 18px 20px; font-size: .74rem; line-height: 1.65;
+  overflow-x: auto; height: 26em;
+}
+.term .p { color: var(--term-prompt); }
+.term .in { color: var(--term-fg); font-weight: 500; }
+.term .k { color: var(--term-key); }
+.term .s { color: var(--term-str); }
+.term .n { color: var(--term-num); }
+.term .d { color: var(--term-dim); }
+.term .ln { display: block; white-space: pre; }
+.term .ln.fresh { animation: arrive .5s ease-out; }
+@keyframes arrive { from { background: rgba(242, 169, 59, .22); } to { background: transparent; } }
+.term .caret { display: inline-block; width: .6em; height: 1.15em; vertical-align: -.2em; background: var(--term-prompt); animation: blink 1s steps(1) infinite; }
+@keyframes blink { 50% { opacity: 0; } }
+.term-note { font-size: .82rem; color: var(--muted); margin: 10px 2px 0; }
+
+/* sections */
+section { padding: 84px 0; }
+.band { background: var(--bg-band); border-block: 1px solid var(--line); }
+.kicker { font: 500 .78rem/1.4 var(--mono); letter-spacing: .08em; text-transform: uppercase; color: var(--accent); margin: 0 0 12px; }
+h2 { font: 700 clamp(1.9rem, 4vw, 2.7rem)/1.08 var(--display); letter-spacing: -.025em; margin: 0 0 16px; max-width: 24ch; }
+h3 { font: 600 1.12rem/1.3 var(--display); margin: 0 0 8px; letter-spacing: -.005em; }
+.section-lede { color: var(--muted); font-size: 1.1rem; max-width: 62ch; margin: 0 0 44px; }
+
+/* events */
+.events { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 14px; }
+.ev { background: var(--card); border: 1px solid var(--line); border-radius: 14px; padding: 18px; min-width: 0; }
+.ev .type { font: 600 .82rem/1.3 var(--mono); color: var(--fg); display: block; margin-bottom: 6px; overflow-wrap: anywhere; }
+.ev .src { font: 500 .7rem/1 var(--mono); text-transform: uppercase; letter-spacing: .06em; color: var(--accent); display: block; margin-bottom: 10px; }
+.ev p { margin: 0; color: var(--muted); font-size: .92rem; line-height: 1.5; }
+.ev.opt { border-style: dashed; }
+
+/* how it works */
+.how { display: grid; grid-template-columns: minmax(0, 1.25fr) minmax(0, .75fr); gap: 44px; align-items: start; }
+.diagram { margin: 0; background: var(--card); border: 1px solid var(--line); border-radius: 14px; padding: 18px; min-width: 0; }
+.diagram svg { width: 100%; height: auto; display: block; }
+.diagram .tall { display: none; max-width: 340px; margin-inline: auto; }
+.diagram text { font-family: var(--mono); fill: var(--fg); }
+.diagram .dim { fill: var(--muted); }
+.diagram .box { fill: var(--bg); stroke: var(--line); stroke-width: 1.5; }
+.diagram .box.hot { stroke: var(--accent-fill); stroke-width: 2; }
+.diagram .wire { stroke: var(--wire); stroke-width: 2; fill: none; }
+.diagram .wire.wait { stroke: var(--wire-live); stroke-dasharray: 5 6; animation: flow 1.4s linear infinite; }
+@keyframes flow { to { stroke-dashoffset: -22; } }
+.diagram figcaption { font-size: .85rem; color: var(--muted); margin-top: 12px; }
+.points { list-style: none; padding: 0; margin: 0; display: grid; gap: 22px; }
+.points li p { margin: 0; color: var(--muted); font-size: .98rem; }
+
+/* notifications */
+.notifs-grid { display: grid; grid-template-columns: minmax(0, .9fr) minmax(0, 1.1fr); gap: 48px; align-items: start; }
+.desk {
+  border-radius: 16px; padding: 22px; min-width: 0;
+  background: linear-gradient(140deg, #3d2f63 0%, #a2486a 55%, #f2a93b 100%);
+  display: grid; gap: 10px;
+}
+.notif {
+  display: grid; grid-template-columns: 38px minmax(0, 1fr); gap: 11px; align-items: start;
+  background: var(--notif-bg); color: var(--notif-fg);
+  -webkit-backdrop-filter: blur(18px); backdrop-filter: blur(18px);
+  border: 1px solid var(--notif-line); border-radius: 16px; padding: 11px 13px;
+  font: 400 .84rem/1.35 system-ui, -apple-system, var(--sans);
+  box-shadow: 0 10px 30px -18px rgba(0,0,0,.6);
+}
+.notif .ico { width: 38px; height: 38px; position: relative; }
+.notif .ico svg { width: 38px; height: 38px; display: block; }
+.notif .ico svg.badge { position: absolute; right: -4px; bottom: -4px; width: 17px; height: 17px; }
+.notif .row { display: flex; justify-content: space-between; gap: 8px; }
+.notif b { font-weight: 600; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.notif time { color: var(--notif-muted); font-size: .76rem; flex: none; }
+.notif p { margin: 1px 0 0; color: var(--notif-fg); overflow-wrap: anywhere; }
+.notif p.sub { color: var(--notif-muted); }
+.desk-note { font-size: .82rem; color: var(--muted); margin: 10px 2px 0; }
+.feature { border-top: 1px solid var(--line); padding: 16px 0; }
+.feature:first-child { border-top: 0; padding-top: 0; }
+.feature p { margin: 0; color: var(--muted); font-size: .97rem; }
+
+/* setup */
+.steps { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 18px; }
+.step { background: var(--card); border: 1px solid var(--line); border-radius: 14px; padding: 22px; min-width: 0; }
+.step p { margin: 0 0 14px; color: var(--muted); font-size: .98rem; }
+.step .num { font: 500 .75rem/1 var(--mono); color: var(--accent); display: block; margin-bottom: 12px; }
+pre.code {
+  margin: 0; background: var(--code-bg); border-radius: 10px; padding: 14px 16px;
+  font-size: .78rem; line-height: 1.6; overflow-x: auto; color: var(--fg);
+}
+pre.code .c { color: var(--muted); }
+pre.code .p { color: var(--accent); user-select: none; }
+
+footer { padding: 40px 0 56px; color: var(--muted); font-size: .9rem; border-top: 1px solid var(--line); }
+footer .wrap { display: flex; flex-wrap: wrap; gap: 12px 28px; justify-content: space-between; }
+footer p { margin: 0; }
+
+@media (max-width: 960px) {
+  .events { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+@media (max-width: 900px) {
+  .hero { grid-template-columns: minmax(0, 1fr); gap: 40px; padding: 16px 0 64px; }
+  .lede { max-width: none; }
+  .how, .notifs-grid { grid-template-columns: minmax(0, 1fr); }
+  section { padding: 64px 0; }
+}
+@media (max-width: 640px) {
+  body { font-size: 1rem; }
+  .steps { grid-template-columns: minmax(0, 1fr); }
+  .events { grid-template-columns: minmax(0, 1fr); }
+  .top nav { gap: 14px; font-size: .9rem; }
+  .top nav .opt { display: none; }
+  .term pre { font-size: .66rem; padding: 14px; height: 24em; }
+  .diagram .wide { display: none; }
+  .diagram .tall { display: block; }
+  .desk { padding: 14px; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .term .caret, .diagram .wire.wait, .term .ln.fresh { animation: none; }
+}
+</style>
+</head>
+<body>
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <defs>
+    <linearGradient id="boltbg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#f7931a"/><stop offset="1" stop-color="#ffc400"/>
+    </linearGradient>
+    <symbol id="nodeicon" viewBox="0 0 32 32">
+      <rect width="32" height="32" rx="7" fill="url(#boltbg)"/>
+      <path d="M18.5 3.5 8 18h7l-2.5 10.5L24 13h-7.3z" fill="#fff"/>
+    </symbol>
+  </defs>
+</svg>
+
+<div class="wrap">
+  <header class="top">
+    <a class="brand" href="#">
+      <svg aria-hidden="true"><use href="#nodeicon"/></svg>
+      lnsocket-monitor
+    </a>
+    <nav aria-label="Primary">
+      <a href="#events">Events</a>
+      <a href="#how">How it works</a>
+      <a class="opt" href="#notifications">Notifications</a>
+      <a href="https://github.com/jb55/lnsocket-monitor">GitHub</a>
+    </nav>
+  </header>
+  <main>
+  <div class="hero">
+    <div>
+      <p class="eyebrow">Core Lightning &middot; commando &middot; JSON lines</p>
+      <h1>lnsocket-monitor<span class="bolt">.</span></h1>
+      <p class="lede">Your Lightning node as a stream of events. <strong>Payments, forwards, deposits and channel changes</strong>, printed the moment the node records them, from anywhere it's reachable on the Lightning port.</p>
+      <div class="actions">
+        <a class="btn primary" href="https://github.com/jb55/lnsocket-monitor">
+          <svg viewBox="0 0 16 16" aria-hidden="true" fill="currentColor"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0 0 16 8c0-4.42-3.58-8-8-8z"/></svg>
+          GitHub
+        </a>
+        <a class="btn" href="#notifications">macOS notifications</a>
+        <a class="btn" href="https://jb55.github.io/lnsocket-rs/">lnsocket</a>
+      </div>
+      <div class="cmd"><code>cargo install --git https://github.com/jb55/lnsocket-monitor</code><button class="copy" type="button" data-copy="cargo install --git https://github.com/jb55/lnsocket-monitor">copy</button></div>
+    </div>
+    <div>
+      <div class="term" role="figure" aria-label="lnsocket-monitor printing JSON events as they happen: monitor_started, then invoice_paid, forward_settled, payment_sent and channel_opened lines">
+        <div class="term-bar"><i></i><i></i><i></i><span>lnsocket-monitor -n mynode</span></div>
+<pre id="stream"><span class="ln"><span class="d">$</span> <span class="in">lnsocket-monitor -n mynode | jq -c</span></span></pre>
+      </div>
+      <p class="term-note">Illustrative output, trimmed. Real lines carry more fields.</p>
+    </div>
+  </div>
+  </main>
+</div>
+
+<section class="band" id="events">
+  <div class="wrap">
+    <p class="kicker">events</p>
+    <h2>Everything worth a glance, one JSON object per line</h2>
+    <p class="section-lede">Every line has <code>type</code>, <code>node</code> and <code>time</code>, with amounts in msat. Pipe it into <code>jq</code>, a bot, a log, or the notifier below. <code>--replay N</code> prints the last N of each kind at startup, so you can see output before anything happens.</p>
+    <div class="events">
+      <div class="ev"><span class="src">invoices</span><span class="type">invoice_paid</span><p>Someone paid you. The description holds the zap request when it's a zap.</p></div>
+      <div class="ev"><span class="src">sendpays</span><span class="type">payment_sent</span><p>A payment you made completed: amount, fee, destination alias, parts.</p></div>
+      <div class="ev"><span class="src">forwards</span><span class="type">forward_settled</span><p>You routed a payment. In and out peers by alias, and the fee you earned.</p></div>
+      <div class="ev"><span class="src">chainmoves</span><span class="type">onchain_deposit</span><p>Coins confirmed in your on-chain wallet, with the txid.</p></div>
+      <div class="ev"><span class="src">chainmoves</span><span class="type">channel_opened</span><p>A channel's funding locked in: peer, capacity, your side, who opened it.</p></div>
+      <div class="ev"><span class="src">chainmoves</span><span class="type">channel_closed</span><p>A channel's funding was spent: peer, capacity, what came back to you.</p></div>
+      <div class="ev opt"><span class="src">networkevents, --peers</span><span class="type">peer_connected</span><p>A channel peer came online. Gossip-only peers are left out.</p></div>
+      <div class="ev opt"><span class="src">networkevents, --peers</span><span class="type">peer_disconnected</span><p>A channel peer went away, with the reason when the node has one.</p></div>
+    </div>
+  </div>
+</section>
+
+<section id="how">
+  <div class="wrap">
+    <p class="kicker">how it works</p>
+    <h2>Nothing is polled</h2>
+    <p class="section-lede">Core Lightning's <code>wait</code> RPC blocks until a subsystem's index moves. The monitor keeps one waiting per subsystem, then reads exactly what changed from the last index it saw.</p>
+    <div class="how">
+      <figure class="diagram" role="img" aria-label="Diagram: the monitor holds four connections to the node, each carrying one blocking wait for invoices, sendpays, forwards or chainmoves, plus a fifth connection for list calls and the heartbeat. Events come out of the monitor as JSON lines on stdout.">
+        <svg class="wide" viewBox="0 0 720 330" aria-hidden="true">
+          <rect class="box hot" x="20" y="40" width="150" height="250" rx="12"/>
+          <text x="95" y="155" text-anchor="middle" font-size="15" font-weight="700">CLN node</text>
+          <text x="95" y="176" text-anchor="middle" font-size="11" class="dim">commando</text>
+
+          <rect class="box hot" x="400" y="40" width="160" height="250" rx="12"/>
+          <text x="480" y="155" text-anchor="middle" font-size="14" font-weight="700">lnsocket-</text>
+          <text x="480" y="174" text-anchor="middle" font-size="14" font-weight="700">monitor</text>
+
+          <g font-size="11">
+            <path class="wire wait" d="M170 75 H400"/><text x="285" y="68" text-anchor="middle">wait invoices</text>
+            <path class="wire wait" d="M170 125 H400"/><text x="285" y="118" text-anchor="middle">wait sendpays</text>
+            <path class="wire wait" d="M170 175 H400"/><text x="285" y="168" text-anchor="middle">wait forwards</text>
+            <path class="wire wait" d="M170 225 H400"/><text x="285" y="218" text-anchor="middle">wait chainmoves</text>
+            <path class="wire" d="M170 270 H400"/><text x="285" y="263" text-anchor="middle" class="dim">list* · listnodes · getinfo</text>
+          </g>
+
+          <path class="wire" d="M560 165 H620"/>
+          <path d="M620 159 l10 6 -10 6z" fill="var(--wire)"/>
+          <text x="675" y="160" text-anchor="middle" font-size="12" font-weight="700">stdout</text>
+          <text x="675" y="178" text-anchor="middle" font-size="11" class="dim">JSON lines</text>
+          <text x="285" y="318" text-anchor="middle" font-size="11" class="dim">one connection per blocking wait, each with its own throwaway key</text>
+        </svg>
+        <svg class="tall" viewBox="0 0 340 520" aria-hidden="true">
+          <rect class="box hot" x="20" y="20" width="300" height="70" rx="12"/>
+          <text x="170" y="52" text-anchor="middle" font-size="15" font-weight="700">CLN node</text>
+          <text x="170" y="72" text-anchor="middle" font-size="11" class="dim">commando</text>
+          <g font-size="10">
+            <path class="wire wait" d="M50 90 V350"/><text x="56" y="200" transform="rotate(90 56 200)">wait invoices</text>
+            <path class="wire wait" d="M110 90 V350"/><text x="116" y="200" transform="rotate(90 116 200)">wait sendpays</text>
+            <path class="wire wait" d="M170 90 V350"/><text x="176" y="200" transform="rotate(90 176 200)">wait forwards</text>
+            <path class="wire wait" d="M230 90 V350"/><text x="236" y="190" transform="rotate(90 236 190)">wait chainmoves</text>
+            <path class="wire" d="M290 90 V350"/><text x="296" y="160" transform="rotate(90 296 160)" class="dim">list* · listnodes · getinfo</text>
+          </g>
+          <rect class="box hot" x="20" y="350" width="300" height="70" rx="12"/>
+          <text x="170" y="391" text-anchor="middle" font-size="14" font-weight="700">lnsocket-monitor</text>
+          <path class="wire" d="M170 420 V462"/>
+          <path d="M164 462 l6 10 6-10z" fill="var(--wire)"/>
+          <text x="170" y="494" text-anchor="middle" font-size="12" font-weight="700">stdout · JSON lines</text>
+        </svg>
+        <figcaption>Dashed lines are blocking <code>wait</code> calls, one per connection. The solid one carries everything else.</figcaption>
+      </figure>
+      <ul class="points">
+        <li><h3>A connection per wait</h3><p>A commando connection answers nothing else while a command runs on it, so each blocking <code>wait</code> gets a socket of its own. The <code>list*</code> calls never queue behind one.</p></li>
+        <li><h3>Catch up from the last index</h3><p>When a <code>wait</code> returns, the monitor lists from the last index it reported, not the one returned. A dropped connection never skips an event.</p></li>
+        <li><h3>Channels from the chain</h3><p>Opens and closes come from chain moves, recorded when the funding locks in and when it's spent, so there's no channel list to diff.</p></li>
+        <li><h3>Notices a dead link</h3><p>Every wait connection pings the node each minute and reconnects when it stops hearing back. Everything it sends is read-only and safe to resend.</p></li>
+      </ul>
+    </div>
+  </div>
+</section>
+
+<section class="band" id="notifications">
+  <div class="wrap">
+    <p class="kicker">contrib/nudge</p>
+    <h2>Notifications from your node, not from a script</h2>
+    <p class="section-lede"><code>contrib/nudge/lnsocket-nudge</code> runs the monitor and posts each event with <a href="https://github.com/jb55/nudge">nudge</a>. It's one Python file with no dependencies.</p>
+    <div class="notifs-grid">
+      <div>
+        <div class="desk" role="img" aria-label="Three example macOS notifications: a zap of 5,000 sats from ada on a note, with her avatar; a channel closed with Wobbly Ferret, with a bolt icon; and 21 sats received for coffee, with a bolt icon">
+          <div class="notif">
+            <div class="ico">
+              <svg viewBox="0 0 38 38" aria-hidden="true"><circle cx="19" cy="19" r="19" fill="#7b5ea7"/><circle cx="19" cy="15" r="7" fill="#e9dcf7"/><path d="M6 33c3-7 8-10 13-10s10 3 13 10" fill="#e9dcf7"/></svg>
+              <svg class="badge" aria-hidden="true"><use href="#nodeicon"/></svg>
+            </div>
+            <div><div class="row"><b>ada</b><time>now</time></div><p>⚡ 5,000 sats from ada · great thread 🧡</p><p class="sub">on: running a node at home, one year in</p></div>
+          </div>
+          <div class="notif">
+            <div class="ico"><svg aria-hidden="true"><use href="#nodeicon"/></svg></div>
+            <div><div class="row"><b>mynode</b><time>2m ago</time></div><p>Channel closed with Wobbly Ferret</p><p class="sub">2,000,000 sats channel, 1,412,880 sats ours</p></div>
+          </div>
+          <div class="notif">
+            <div class="ico"><svg aria-hidden="true"><use href="#nodeicon"/></svg></div>
+            <div><div class="row"><b>mynode</b><time>9m ago</time></div><p>⚡ Received 21 sats</p><p class="sub">coffee</p></div>
+          </div>
+        </div>
+        <p class="desk-note">Mock-ups. Names, amounts and notes are made up.</p>
+      </div>
+      <div>
+        <div class="feature"><h3>Zaps with a face</h3><p>A zap invoice carries the zap request. The zapper's profile and the zapped note are looked up on a local nostr relay (notedeck's, <code>ws://127.0.0.1:6677</code>), so the notification shows who it was, their picture and what they zapped.</p></div>
+        <div class="feature"><h3>Click to open</h3><p>Clicking a zap runs <code>nd call open nostr:note1…</code> through nudge's <code>actions.json</code>, opening the note in notedeck, or the profile for a profile zap. Chain events open the transaction on mempool.space.</p></div>
+        <div class="feature"><h3>Your node's icon</h3><p>Everything else wears a bolt icon with the node's alias as the sender, so it never looks like a generic script notification.</p></div>
+        <div class="feature"><h3>Keeps running</h3><p>The monitor is restarted if it exits. <code>--skip forward_settled</code> drops kinds you don't want, and <code>--dry-run</code> prints instead of posting.</p></div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="setup">
+  <div class="wrap">
+    <p class="kicker">setup</p>
+    <h2>Four steps from rune to notification</h2>
+    <p class="section-lede">The monitor reads the same config as <a href="https://jb55.github.io/lnsocket-rs/#lnrpc">lnrpc</a>, so a node you already call by name works as is.</p>
+    <div class="steps">
+      <div class="step">
+        <span class="num">01 · on the node</span>
+        <h3>Make a read-only rune</h3>
+        <p>Lists, gets and <code>wait</code>, and nothing that spends.</p>
+<pre class="code"><span class="p">$ </span>lightning-cli createrune restrictions='[["method^list","method^get","method=wait"],["method/listdatastore"]]'</pre>
+      </div>
+      <div class="step">
+        <span class="num">02 · on your machine</span>
+        <h3>Save the node</h3>
+        <p>Kept in <code>~/.config/lnrpc/config.toml</code>, mode 0600. The first node is the default.</p>
+<pre class="code"><span class="p">$ </span>lnrpc config add mynode 02a1…c3f9 ln.example.com &lt;rune&gt;</pre>
+      </div>
+      <div class="step">
+        <span class="num">03</span>
+        <h3>Install and watch</h3>
+        <p>Replay a few old events to see the shape of the output.</p>
+<pre class="code"><span class="p">$ </span>cargo install --git https://github.com/jb55/lnsocket-monitor
+<span class="p">$ </span>lnsocket-monitor --replay 3</pre>
+      </div>
+      <div class="step">
+        <span class="num">04 · macOS</span>
+        <h3>Turn on notifications</h3>
+        <p>Install nudge, then run the notifier from a checkout.</p>
+<pre class="code"><span class="p">$ </span>brew install --cask jb55/nudge/nudge &amp;&amp; nudge --authorize
+<span class="p">$ </span>git clone https://github.com/jb55/lnsocket-monitor
+<span class="p">$ </span>lnsocket-monitor/contrib/nudge/lnsocket-nudge</pre>
+      </div>
+    </div>
+  </div>
+</section>
+
+<footer>
+  <div class="wrap">
+    <p>lnsocket-monitor · MIT · built on <a href="https://github.com/jb55/lnsocket-rs">lnsocket-rs</a></p>
+    <p><a href="https://github.com/jb55/lnsocket-monitor">github.com/jb55/lnsocket-monitor</a></p>
+  </div>
+</footer>
+
+<script>
+(function () {
+  // copy buttons
+  document.querySelectorAll('.copy').forEach(function (b) {
+    b.addEventListener('click', function () {
+      navigator.clipboard.writeText(b.dataset.copy).then(function () {
+        b.textContent = 'copied';
+        setTimeout(function () { b.textContent = 'copy'; }, 1400);
+      }, function () {});
+    });
+  });
+
+  // the event stream in the hero
+  var events = [
+    {type: 'monitor_started', node: 'mynode', alias: 'mynode', version: 'v26.06'},
+    {type: 'invoice_paid', node: 'mynode', label: 'coffee', amount_received_msat: 21000},
+    {type: 'forward_settled', node: 'mynode', in_alias: 'Wobbly Ferret', out_alias: 'Quiet Heron', out_msat: 150000, fee_msat: 37},
+    {type: 'invoice_paid', node: 'mynode', label: 'zap', amount_received_msat: 5000000},
+    {type: 'payment_sent', node: 'mynode', destination_alias: 'Quiet Heron', amount_msat: 2100000, fee_msat: 2100, parts: 1},
+    {type: 'onchain_deposit', node: 'mynode', amount_msat: 250000000, blockheight: 921344},
+    {type: 'channel_opened', node: 'mynode', peer_alias: 'Lucky Otter', capacity_msat: 1000000000, opener: 'remote'},
+    {type: 'forward_settled', node: 'mynode', in_alias: 'Lucky Otter', out_alias: 'Wobbly Ferret', out_msat: 40000, fee_msat: 12}
+  ];
+  var pre = document.getElementById('stream');
+  function esc(s) { return s.replace(/&/g, '&amp;').replace(/</g, '&lt;'); }
+  function render(o) {
+    var parts = Object.keys(o).map(function (k) {
+      var v = o[k];
+      var val = typeof v === 'number' ? '<span class="n">' + v + '</span>' : '<span class="s">"' + esc(String(v)) + '"</span>';
+      return '<span class="k">"' + k + '"</span>:' + val;
+    });
+    return '{' + parts.join(',') + '}';
+  }
+  function line(html, fresh) {
+    var s = document.createElement('span');
+    s.className = 'ln' + (fresh ? ' fresh' : '');
+    s.innerHTML = html;
+    pre.appendChild(s);
+    pre.scrollTop = pre.scrollHeight;
+  }
+  var reduce = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+  if (reduce) {
+    events.forEach(function (e) { line(render(e)); });
+    return;
+  }
+  var i = 0;
+  var caret = document.createElement('span');
+  caret.className = 'ln';
+  caret.innerHTML = '<span class="caret" aria-hidden="true"></span>';
+  function next() {
+    if (caret.parentNode) caret.remove();
+    if (i < events.length) {
+      line(render(events[i++]), true);
+      pre.appendChild(caret);
+      setTimeout(next, i === 1 ? 700 : 1400 + Math.random() * 1600);
+    } else {
+      pre.appendChild(caret);
+      setTimeout(function () {
+        while (pre.children.length > 1) pre.removeChild(pre.lastChild);
+        i = 0;
+        next();
+      }, 6000);
+    }
+  }
+  setTimeout(next, 500);
+})();
+</script>
+</body>
+</html>
