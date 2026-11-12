@@ -16,6 +16,7 @@ The monitor is restarted if it exits.
 
 import argparse
 import base64
+import datetime
 import hashlib
 import json
 import os
@@ -35,8 +36,22 @@ REPO = Path(__file__).resolve().parent.parent.parent
 CACHE = Path.home() / "Library" / "Caches" / "lnsocket-nudge"
 
 
-def log(msg):
-    print(f"lnsocket-nudge: {msg}", file=sys.stderr, flush=True)
+def _logfmt_value(v):
+    v = str(v)
+    if v and all(c > " " and c not in '"=\\' and c != "\x7f" for c in v):
+        return v
+    v = v.replace("\\", "\\\\").replace('"', '\\"')
+    v = v.replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t")
+    return f'"{v}"'
+
+
+def log(msg, level="info", **fields):
+    """One logfmt line on stderr, in the same shape as lnsocket-monitor's."""
+    ts = datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="milliseconds")
+    parts = [f"ts={ts.replace('+00:00', 'Z')}", f"level={level}", "src=nudge",
+             f"msg={_logfmt_value(msg)}"]
+    parts += [f"{k}={_logfmt_value(v)}" for k, v in fields.items() if v is not None]
+    print(" ".join(parts), file=sys.stderr, flush=True)
 
 
 # --- formatting ---------------------------------------------------------------
@@ -200,7 +215,7 @@ def relay_lookup(url, pubkey, note_id):
     try:
         relay = Relay(url)
     except (OSError, ValueError, ConnectionError) as e:
-        log(f"relay {url}: {e}")
+        log("relay lookup failed", "warn", relay=url, err=e)
         return None, None
     profile = note = None
     try:
@@ -213,7 +228,7 @@ def relay_lookup(url, pubkey, note_id):
             elif ev.get("id") == note_id:
                 note = ev.get("content")
     except (OSError, ValueError, ConnectionError) as e:
-        log(f"relay {url}: {e}")
+        log("relay lookup failed", "warn", relay=url, err=e)
     finally:
         relay.close()
     return profile, note
@@ -239,7 +254,7 @@ def avatar_png(url):
         )
         return str(out)
     except (OSError, subprocess.SubprocessError, ValueError) as e:
-        log(f"avatar {url}: {e}")
+        log("avatar failed", "warn", url=url, err=e)
         return None
     finally:
         raw.unlink(missing_ok=True)
@@ -431,7 +446,7 @@ HANDLERS = {
 }
 
 
-def post(n, node, args):
+def post(n, node, typ, args):
     cmd = [args.nudge, "--title", n["title"], "--message", n["message"],
            "--thread", f"lnsocket-{node}-{n['thread']}"]
     for key in ("subtitle", "url"):
@@ -454,20 +469,22 @@ def post(n, node, args):
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
         if r.returncode != 0:
-            log(f"nudge exited {r.returncode}: {r.stderr.strip()}")
+            log("nudge failed", "warn", type=typ, code=r.returncode, err=r.stderr.strip())
+        else:
+            log("posted", type=typ, title=n["title"])
     except (OSError, subprocess.SubprocessError) as e:
-        log(f"nudge: {e}")
+        log("nudge failed", "warn", type=typ, err=e)
 
 
 def handle(line, args):
     try:
         ev = json.loads(line)
     except ValueError:
-        log(f"not json: {line[:200]}")
+        log("not json", "warn", line=line[:200])
         return
     typ = ev.get("type")
     if typ == "monitor_started":
-        log(f"watching {ev.get('alias')} ({ev.get('node')})")
+        log("monitor started", node=ev.get("node"), alias=ev.get("alias"))
         args.node_alias = ev.get("alias")
         return
     if typ in args.skip or typ not in HANDLERS:
@@ -475,10 +492,10 @@ def handle(line, args):
     try:
         n = HANDLERS[typ](ev, args)
     except Exception as e:  # one odd event shouldn't stop the rest
-        log(f"{typ}: {e!r}")
+        log("format failed", "warn", type=typ, err=repr(e))
         return
     if n:
-        post(n, ev.get("node", "ln"), args)
+        post(n, ev.get("node", "ln"), typ, args)
 
 
 def find_monitor():
@@ -519,7 +536,7 @@ def main():
         try:
             args.icon = node_icon()
         except OSError as e:
-            log(f"node icon: {e}")
+            log("node icon failed", "warn", err=e)
             args.icon = ""
 
     # eg. `lnsocket-monitor --replay 5 | lnsocket-nudge --stdin`, or a saved log.
@@ -531,12 +548,12 @@ def main():
     backoff = 5
     while True:
         started = time.monotonic()
-        log(f"starting {args.monitor} {' '.join(monitor_args)}")
+        log("starting monitor", cmd=" ".join([args.monitor, *monitor_args]))
         try:
             proc = subprocess.Popen([args.monitor, *monitor_args], stdout=subprocess.PIPE,
                                     text=True, bufsize=1)
         except OSError as e:
-            log(f"can't run {args.monitor}: {e}")
+            log("can't run monitor", "warn", cmd=args.monitor, err=e)
             sys.exit(1)
         try:
             for line in proc.stdout:
@@ -549,7 +566,7 @@ def main():
         # A monitor that ran a while gets restarted quickly; one that keeps
         # dying straight away backs off.
         backoff = 5 if time.monotonic() - started > 300 else min(backoff * 2, 300)
-        log(f"monitor exited ({code}); restarting in {backoff}s")
+        log("monitor exited", "warn", code=code, restart_in=f"{backoff}s")
         try:
             time.sleep(backoff)
         except KeyboardInterrupt:

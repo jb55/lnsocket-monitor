@@ -29,6 +29,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::str::FromStr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use lnsocket::bitcoin::secp256k1::{PublicKey, SecretKey, rand};
@@ -44,13 +45,17 @@ use serde_json::{Map, Value, json};
 use tokio::sync::mpsc;
 
 const USAGE: &str = "\
-usage: lnsocket-monitor [-c <config>] [-n <node>] [--replay <n>] [--peers]
+usage: lnsocket-monitor [-c <config>] [-n <node>] [--replay <n>] [--peers] [-v]
 
   -c, --config <path>   lnrpc config file (default: $LNRPC_CONFIG or ~/.config/lnrpc/config.toml)
   -n, --node <name>     node from the config (default: its `default`)
   --replay <n>          also report the last <n> updates of each kind on startup (for testing)
   --peers               also report channel peers connecting and disconnecting. this
                         wakes on every network event the node logs, pings included
+  -v, --verbose         also log heartbeats and network event catch-ups
+
+events go to stdout. the log goes to stderr in logfmt: ts, level (debug, info,
+warn), src=monitor, msg, then fields.
 
 prints one JSON object per line: monitor_started, invoice_paid, payment_sent,
 forward_settled, onchain_deposit, channel_opened, channel_closed, and with
@@ -96,6 +101,7 @@ struct Opts {
     node: Option<String>,
     replay: u64,
     peers: bool,
+    verbose: bool,
 }
 
 /// A CLN `wait` subsystem and the `list*` call that reads what changed.
@@ -172,6 +178,7 @@ async fn run() -> Result<(), String> {
         .clone();
     let pubkey = PublicKey::from_str(&node.nodeid)
         .map_err(|e| format!("invalid nodeid '{}': {e}", node.nodeid))?;
+    VERBOSE.store(opts.verbose, Ordering::Relaxed);
 
     let calls = connect_calls(&node, pubkey).await;
     let mut mon = Monitor {
@@ -184,6 +191,7 @@ async fn run() -> Result<(), String> {
         sent: HashSet::new(),
         peers: Peers::default(),
         aliases: HashMap::new(),
+        emitted: 0,
     };
     mon.start().await;
 
@@ -205,11 +213,10 @@ async fn run() -> Result<(), String> {
                 Some((w, cur)) => mon.catch_up(w, cur).await,
                 None => return Err("no subsystems left to watch".into()),
             },
-            _ = heartbeat.tick() => {
-                if let Err(e) = mon.call("getinfo", json!({})).await {
-                    log(&format!("heartbeat: {e}"));
-                }
-            }
+            _ = heartbeat.tick() => match mon.call("getinfo", json!({})).await {
+                Ok(_) => log!(Debug, "heartbeat"),
+                Err(e) => log!(Warn, "heartbeat failed", err = e),
+            },
         }
     }
 }
@@ -220,6 +227,7 @@ fn parse_args(mut args: Vec<String>) -> Result<Option<Opts>, String> {
         node: None,
         replay: 0,
         peers: false,
+        verbose: false,
     };
     while !args.is_empty() {
         let flag = args.remove(0);
@@ -239,6 +247,7 @@ fn parse_args(mut args: Vec<String>) -> Result<Option<Opts>, String> {
                 opts.replay = v.parse().map_err(|_| format!("bad --replay '{v}'"))?;
             }
             "--peers" => opts.peers = true,
+            "-v" | "--verbose" => opts.verbose = true,
             other => return Err(format!("unknown argument '{other}'\n\n{USAGE}")),
         }
     }
@@ -269,9 +278,13 @@ async fn connect_sock(node: &Node, pubkey: PublicKey, what: &str) -> LNSocket {
     loop {
         let key = SecretKey::new(&mut rand::thread_rng());
         match LNSocket::connect_and_init(key, pubkey, &addr).await {
-            Ok(sock) => return sock,
+            Ok(sock) => {
+                log!(Info, "connected", conn = what, addr = addr);
+                return sock;
+            }
             Err(e) => {
-                log(&format!("{what}: connecting to {addr}: {e}"));
+                let retry = format!("{}s", backoff.as_secs());
+                log!(Warn, "connect failed", conn = what, addr = addr, err = e, retry_in = retry);
                 tokio::time::sleep(backoff).await;
                 backoff = (backoff * 2).min(Duration::from_secs(60));
             }
@@ -328,11 +341,11 @@ async fn wait_loop(
                     next = cur + 1;
                 }
                 Err(WaitError::Rpc(msg)) => {
-                    log(&format!("{}: not watching ({msg})", w.subsystem));
+                    log!(Warn, "not watching", conn = w.subsystem, err = msg);
                     return;
                 }
                 Err(WaitError::Conn(msg)) => {
-                    log(&format!("{}: {msg}; reconnecting", w.subsystem));
+                    log!(Warn, "reconnecting", conn = w.subsystem, reason = msg);
                     break;
                 }
             }
@@ -435,6 +448,8 @@ struct Monitor {
     peers: Peers,
     /// Node id -> alias (None when the node has no announcement).
     aliases: HashMap<String, Option<String>>,
+    /// Events printed so far, for the catch-up log lines.
+    emitted: u64,
 }
 
 impl Monitor {
@@ -442,6 +457,8 @@ impl Monitor {
         loop {
             match self.call("getinfo", json!({})).await {
                 Ok(info) => {
+                    log!(Info, "started", node = self.name, alias = str_of(&info["alias"]),
+                        version = str_of(&info["version"]));
                     return self.emit(
                         "monitor_started",
                         json!({
@@ -453,7 +470,7 @@ impl Monitor {
                     );
                 }
                 Err(e) => {
-                    log(&format!("getinfo: {e}"));
+                    log!(Warn, "getinfo failed", err = e);
                     tokio::time::sleep(Duration::from_secs(5)).await;
                 }
             }
@@ -464,6 +481,9 @@ impl Monitor {
     /// `cur`, the index its `wait` just returned.
     async fn catch_up(&mut self, w: &'static Watch, cur: u64) {
         let replay = self.replay;
+        if !self.seen.contains_key(w.subsystem) {
+            log!(Info, "watching", sub = w.subsystem, index = cur);
+        }
         let seen = *self
             .seen
             .entry(w.subsystem)
@@ -482,11 +502,12 @@ impl Monitor {
                     _ => break Vec::new(),
                 },
                 Err(e) => {
-                    log(&format!("{}: {e}", w.list));
+                    log!(Warn, "list failed", sub = w.subsystem, method = w.list, err = e);
                     tokio::time::sleep(Duration::from_secs(5)).await;
                 }
             }
         };
+        let before = self.emitted;
 
         for item in &items {
             match w.subsystem {
@@ -503,11 +524,16 @@ impl Monitor {
 
         let index_key = format!("{}_index", w.indexname);
         let newest = items.iter().filter_map(|it| it[&index_key].as_u64()).max();
-        self.seen
-            .insert(w.subsystem, newest.unwrap_or(0).max(cur));
+        let to = newest.unwrap_or(0).max(cur);
+        self.seen.insert(w.subsystem, to);
+
+        // Network events include every ping, so they're only logged with -v.
+        let level = if w.subsystem == "networkevents" { Debug } else { Info };
+        log!(level, "caught_up", sub = w.subsystem, from = seen + 1, to = to,
+            items = items.len(), events = self.emitted - before);
     }
 
-    fn on_invoice(&self, inv: &Value) {
+    fn on_invoice(&mut self, inv: &Value) {
         if inv["status"] != "paid" {
             return;
         }
@@ -693,7 +719,7 @@ impl Monitor {
             let res = match self.call_with(method, json!({}), opts).await {
                 Ok(res) => res,
                 Err(e) => {
-                    log(&format!("{method}: {e}"));
+                    log!(Warn, "peer lookup failed", method = method, err = e);
                     continue;
                 }
             };
@@ -754,13 +780,15 @@ impl Monitor {
         // means the pump has given up and stopped, failing everything pending
         // first. Nothing is left on the old client, so start a new one.
         if let Err(Error::Io(std::io::ErrorKind::BrokenPipe)) = res {
-            log("rpc connection closed; reconnecting");
+            log!(Warn, "reconnecting", conn = "rpc", reason = "pump stopped");
             self.calls = connect_calls(&self.node, self.pubkey).await;
         }
         res
     }
 
-    fn emit(&self, typ: &str, fields: Value) {
+    fn emit(&mut self, typ: &str, fields: Value) {
+        self.emitted += 1;
+        log!(Info, "event", r#type = typ);
         let mut obj = Map::new();
         obj.insert("type".into(), typ.into());
         obj.insert("node".into(), self.name.as_str().into());
@@ -785,6 +813,84 @@ fn str_of(v: &Value) -> &str {
     v.as_str().unwrap_or("")
 }
 
-fn log(msg: &str) {
-    eprintln!("lnsocket-monitor: {msg}");
+static VERBOSE: AtomicBool = AtomicBool::new(false);
+
+#[derive(Clone, Copy, PartialEq)]
+enum Level {
+    Debug,
+    Info,
+    Warn,
+}
+use Level::{Debug, Info, Warn};
+
+/// `log!(Info, "msg", key = value, ...)`: one logfmt line on stderr.
+macro_rules! log {
+    ($level:expr, $msg:expr $(, $key:ident = $val:expr)* $(,)?) => {
+        logfmt($level, $msg, &[$((stringify!($key), &$val as &dyn std::fmt::Display)),*])
+    };
+}
+use log;
+
+fn logfmt(level: Level, msg: &str, fields: &[(&str, &dyn std::fmt::Display)]) {
+    if level == Debug && !VERBOSE.load(Ordering::Relaxed) {
+        return;
+    }
+    let level = match level {
+        Debug => "debug",
+        Info => "info",
+        Warn => "warn",
+    };
+    let mut line = format!("ts={} level={level} src=monitor msg={}", timestamp(), quote(msg));
+    for (key, val) in fields {
+        let key = key.trim_start_matches("r#");
+        line.push_str(&format!(" {key}={}", quote(&val.to_string())));
+    }
+    eprintln!("{line}");
+}
+
+/// A logfmt value: bare when it can be, quoted and escaped otherwise.
+fn quote(v: &str) -> String {
+    let bare = !v.is_empty()
+        && v.chars().all(|c| c > ' ' && c != '"' && c != '=' && c != '\\' && c != '\x7f');
+    if bare {
+        return v.to_string();
+    }
+    let mut out = String::with_capacity(v.len() + 2);
+    out.push('"');
+    for c in v.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// Now in UTC, eg. 2026-11-12T11:00:38.123Z, without a date crate.
+fn timestamp() -> String {
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
+    let secs = now.as_secs() as i64;
+    let (days, rem) = (secs.div_euclid(86400), secs.rem_euclid(86400));
+    // Howard Hinnant's days_from_civil, inverted.
+    let z = days + 719468;
+    let era = z.div_euclid(146097);
+    let doe = z.rem_euclid(146097);
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}.{:03}Z",
+        rem / 3600,
+        rem % 3600 / 60,
+        rem % 60,
+        now.subsec_millis()
+    )
 }
