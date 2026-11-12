@@ -57,6 +57,24 @@ Every line has `type`, `node` (the config name) and `time`. Amounts are msat.
 {"type":"invoice_paid","node":"mynode","time":1794390955,"label":"coffee","amount_msat":21000,"amount_received_msat":21000,"payment_hash":"…","bolt12":false}
 ```
 
+## Logs
+
+Events go to stdout; the log goes to stderr in logfmt, one line per
+connect, reconnect, catch-up and event, so a quiet monitor can be told
+apart from a stuck one:
+
+```
+ts=2026-11-12T11:09:05.091Z level=info src=monitor msg=watching sub=invoices index=232587
+ts=2026-11-12T11:20:41.517Z level=info src=monitor msg=event type=invoice_paid
+ts=2026-11-12T11:20:41.517Z level=info src=monitor msg=caught_up sub=invoices from=232588 to=232588 items=1 events=1
+ts=2026-11-12T11:20:42.210Z level=info src=nudge msg=posted type=invoice_paid title="⚡ 21 sats from ada"
+ts=2026-11-12T13:02:10.004Z level=warn src=monitor msg=reconnecting conn=forwards reason="no reply to pings"
+```
+
+`-v` adds heartbeats and network event catch-ups (with `--peers` those come
+every few seconds). `lnsocket-nudge` writes the same format with
+`src=nudge`, so under launchd both land in one file.
+
 ## How it works
 
 Nothing is polled. Each subsystem is watched with CLN's `wait`, which
